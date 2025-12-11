@@ -81,8 +81,6 @@ class vLLMHttpServerBase:
         node_rank: int,
         gpus_per_node: int,
         nnodes: int,
-        master_addr: str,
-        master_port: str,
     ):
         """
         Args:
@@ -97,9 +95,6 @@ class vLLMHttpServerBase:
             master_port (str): master port for vllm's multiproc torch distributed initialization.
         """
         super().__init__()
-        # FIXME: move to AgentLoopManager._initialize_llm_servers
-        os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = master_port
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
@@ -459,10 +454,8 @@ class vLLMHttpServer(vLLMHttpServerBase):
         node_rank: int,
         gpus_per_node: int,
         nnodes: int,
-        master_addr: str,
-        master_port: str,
     ):
-        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes, master_addr, master_port)
+        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
@@ -506,8 +499,6 @@ class vLLMReplica(RolloutReplica):
             ]
         )
         worker_node_ids = [worker_info[0] for worker_info in worker_infos]
-        worker_master_addrs = [worker_info[1] for worker_info in worker_infos]
-        worker_master_ports = [worker_info[2] for worker_info in worker_infos]
 
         # For non-data parallel case, there's only one server whether it's single or multi nodes.
         nnodes, gpus_per_node = self.nnodes, self.gpus_per_node
@@ -528,11 +519,9 @@ class vLLMReplica(RolloutReplica):
             )
             local_rank_offset = 0
         global_rank_offset = self.replica_rank * self.world_size
-        cuda_visible_devices = ",".join(str(i) for i in range(0, self.n_gpus_per_node))
+
         env_vars = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-            "CUDA_VISIBLE_DEVICES": cuda_visible_devices,
-            "WORLD_SIZE": str(self.world_size),  # FIXME: move to AgentLoopManager._initialize_llm_servers
             "VERL_VLLM_VOCAB_SIZE": str(len(self.model_config.tokenizer)),
             "VERL_VLLM_MULTIPROC_LOCAL_RANK_OFFSET": str(local_rank_offset),
             "VERL_VLLM_MULTIPROC_GLOBAL_RANK_OFFSET": str(global_rank_offset),
@@ -542,8 +531,6 @@ class vLLMReplica(RolloutReplica):
         for node_rank in range(nnodes):
             workers = self.workers[node_rank * gpus_per_node : (node_rank + 1) * gpus_per_node]
             node_id = worker_node_ids[node_rank * gpus_per_node]
-            master_addr = worker_master_addrs[node_rank * gpus_per_node]
-            master_port = worker_master_ports[node_rank * gpus_per_node]
             name = (
                 f"vllm_server_{self.replica_rank}_{node_rank}"
                 if not self.is_reward_model
@@ -565,8 +552,6 @@ class vLLMReplica(RolloutReplica):
                 node_rank=node_rank,
                 gpus_per_node=gpus_per_node,
                 nnodes=nnodes,
-                master_addr=master_addr,
-                master_port=master_port,
             )
             self.servers.append(server)
 
