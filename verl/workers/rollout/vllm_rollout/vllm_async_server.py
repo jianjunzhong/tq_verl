@@ -522,6 +522,10 @@ class vLLMReplica(RolloutReplica):
 
         env_vars = {
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+            "CUDA_VISIBLE_DEVICES": os.environ["CUDA_VISIBLE_DEVICES"],
+            "WORLD_SIZE": os.environ["WORLD_SIZE"],
+            "MASTER_ADDR": os.environ["MASTER_ADDR"],
+            "MASTER_PORT": os.environ["MASTER_PORT"],
             "VERL_VLLM_VOCAB_SIZE": str(len(self.model_config.tokenizer)),
             "VERL_VLLM_MULTIPROC_LOCAL_RANK_OFFSET": str(local_rank_offset),
             "VERL_VLLM_MULTIPROC_GLOBAL_RANK_OFFSET": str(global_rank_offset),
