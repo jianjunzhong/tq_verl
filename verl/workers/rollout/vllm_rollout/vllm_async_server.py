@@ -81,6 +81,8 @@ class vLLMHttpServerBase:
         node_rank: int,
         gpus_per_node: int,
         nnodes: int,
+        master_addr: str,
+        master_port: str,
     ):
         """
         Args:
@@ -91,8 +93,13 @@ class vLLMHttpServerBase:
             node_rank (int): node rank.
             gpus_per_node (int): number of gpus per node.
             nnodes (int): number of nodes.
+            master_addr (str): master address for vllm's multiproc torch distributed initialization.
+            master_port (str): master port for vllm's multiproc torch distributed initialization.
         """
         super().__init__()
+        # FIXME: move to AgentLoopManager._initialize_llm_servers
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = master_port
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
@@ -142,24 +149,8 @@ class vLLMHttpServerBase:
         return self._server_address, self._server_port
 
     def _generate_executor_zmq_address(self) -> str:
-        tensor_parallel_size = self.config.tensor_model_parallel_size
-        # single node: ipc, multi nodes: tcp
-        local_world_size = int(os.environ["VERL_N_GPUS_PER_NODE"])
-        socket_type = "ipc" if tensor_parallel_size <= local_world_size else "tcp"
-
-        # File lock to prevent multiple workers listen to same port
-        with FileLock(f"/tmp/verl_vllm_zmq_{getpass.getuser()}.lock"):
-            if socket_type == "ipc":
-                pid = os.getpid()
-                address = f"ipc:///tmp/verl_vllm_zmq_{pid}_{getpass.getuser()}.ipc"
-            else:
-                ip = ray.util.get_node_ip_address().strip("[]")
-                port, sock = get_free_port(ip)
-                if is_valid_ipv6_address(ip):
-                    address = f"tcp://[{ip}]:{port}"
-                else:
-                    address = f"tcp://{ip}:{port}"
-
+        pid = os.getpid()
+        address = f"ipc:///tmp/verl_vllm_zmq_{pid}_{getpass.getuser()}.ipc"
         return address
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
@@ -468,8 +459,10 @@ class vLLMHttpServer(vLLMHttpServerBase):
         node_rank: int,
         gpus_per_node: int,
         nnodes: int,
+        master_addr: str,
+        master_port: str,
     ):
-        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
+        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes, master_addr, master_port)
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
@@ -503,13 +496,18 @@ class vLLMReplica(RolloutReplica):
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
 
-        # get node_id of all workers
-        worker_node_ids = await asyncio.gather(
+        # get (node_id, MASTER_ADDR, MASTER_PORT) of all workers
+        worker_infos = await asyncio.gather(
             *[
-                worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                worker.__ray_call__.remote(
+                    lambda self: (ray.get_runtime_context().get_node_id(), os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"])
+                )
                 for worker in self.workers
             ]
         )
+        worker_node_ids = [worker_info[0] for worker_info in worker_infos]
+        worker_master_addrs = [worker_info[1] for worker_info in worker_infos]
+        worker_master_ports = [worker_info[2] for worker_info in worker_infos]
 
         # For non-data parallel case, there's only one server whether it's single or multi nodes.
         nnodes, gpus_per_node = self.nnodes, self.gpus_per_node
@@ -517,33 +515,35 @@ class vLLMReplica(RolloutReplica):
             nnodes = 1
             gpus_per_node = self.world_size
         
-        env_vars = {
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-            "VERL_N_GPUS_PER_NODE": str(self.n_gpus_per_node),
-            "VERL_VLLM_VOCAB_SIZE": str(len(self.model_config.tokenizer))
-        }
         if self.n_gpus_per_node > self.world_size:
             assert self.n_gpus_per_node % self.world_size == 0, (
                 f"n_gpus_per_node {self.n_gpus_per_node} must be divisible by world_size {self.world_size}"
                 f"while n_gpus_per_node > world_size"
             )
-            start_device_index = self.replica_rank * self.world_size % self.n_gpus_per_node
-            end_device_index = start_device_index + self.world_size
-            CUDA_VISIBLE_DEVICES = ",".join(str(i) for i in range(start_device_index, end_device_index))
+            local_rank_offset = self.replica_rank * self.world_size % self.n_gpus_per_node
         else:
             assert self.world_size % self.n_gpus_per_node == 0, (
                 f"world_size {self.world_size} must be divisible by n_gpus_per_node {self.n_gpus_per_node}"
                 f"while world_size >= n_gpus_per_node"
             )
-            CUDA_VISIBLE_DEVICES = ",".join(str(i) for i in range(self.n_gpus_per_node))
-        env_vars.update({
-            "CUDA_VISIBLE_DEVICES": CUDA_VISIBLE_DEVICES
-        })
+            local_rank_offset = 0
+        global_rank_offset = self.replica_rank * self.world_size
+        cuda_visible_devices = ",".join(str(i) for i in range(0, self.n_gpus_per_node))
+        env_vars = {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+            "CUDA_VISIBLE_DEVICES": cuda_visible_devices,
+            "WORLD_SIZE": str(self.world_size),  # FIXME: move to AgentLoopManager._initialize_llm_servers
+            "VERL_VLLM_VOCAB_SIZE": str(len(self.model_config.tokenizer)),
+            "VERL_VLLM_MULTIPROC_LOCAL_RANK_OFFSET": str(local_rank_offset),
+            "VERL_VLLM_MULTIPROC_GLOBAL_RANK_OFFSET": str(global_rank_offset),
+        }
 
         # create server actor in each node with node affinity
         for node_rank in range(nnodes):
             workers = self.workers[node_rank * gpus_per_node : (node_rank + 1) * gpus_per_node]
             node_id = worker_node_ids[node_rank * gpus_per_node]
+            master_addr = worker_master_addrs[node_rank * gpus_per_node]
+            master_port = worker_master_ports[node_rank * gpus_per_node]
             name = (
                 f"vllm_server_{self.replica_rank}_{node_rank}"
                 if not self.is_reward_model
@@ -565,6 +565,8 @@ class vLLMReplica(RolloutReplica):
                 node_rank=node_rank,
                 gpus_per_node=gpus_per_node,
                 nnodes=nnodes,
+                master_addr=master_addr,
+                master_port=master_port,
             )
             self.servers.append(server)
 
