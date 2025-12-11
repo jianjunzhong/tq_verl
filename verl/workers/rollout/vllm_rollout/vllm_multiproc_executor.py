@@ -45,7 +45,7 @@ except ModuleNotFoundError:
     # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
     from vllm.v1.worker.worker_base import WorkerWrapperBase
 
-from verl.utils.distributed import initialize_global_process_group
+from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 
 logger = logging.getLogger(__file__)
@@ -85,7 +85,7 @@ class vLLMWorkerProc(WorkerProc):
         local_rank_offset = int(os.environ.get("VERL_VLLM_MULTIPROC_LOCAL_RANK_OFFSET", "0"))
         global_rank_offset = int(os.environ.get("VERL_VLLM_MULTIPROC_GLOBAL_RANK_OFFSET", "0"))
         all_kwargs: list[dict] = [{}]
-        all_kwargs[rank] = {
+        all_kwargs[0] = {
             "vllm_config": vllm_config,
             "local_rank": local_rank + local_rank_offset,
             "rank": rank + global_rank_offset,
@@ -95,7 +95,7 @@ class vLLMWorkerProc(WorkerProc):
         os.environ["RANK"] = str(rank + global_rank_offset)
         os.environ["LOCAL_RANK"] = str(local_rank + local_rank_offset)
         if not torch.distributed.is_initialized():
-            initialize_global_process_group()
+            initialize_global_process_group_ray()
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1":
             apply_vllm_fp8_patches()
         wrapper = WorkerWrapperBase(vllm_config=vllm_config)
