@@ -1,0 +1,81 @@
+## FRROM nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc5
+FROM urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202512151112-9977
+
+RUN pip install pybind11
+
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    apt-get update && \
+    apt-get -y install cudnn
+
+RUN pip install nvidia-mathdx
+
+RUN pip install --upgrade --no-cache-dir transformers tokenizers
+
+RUN pip install codetiming tensordict mathruler pylatexenc qwen_vl_utils
+
+# =========================
+# Install DeepEP
+# =========================
+# the dependency of IBGDA
+# RUN ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+
+# Clone and build deepep and deepep-nvshmem
+WORKDIR /home/dpsk_a2a
+RUN git clone -b v2.3.1 https://github.com/NVIDIA/gdrcopy.git && \
+    git clone https://github.com/deepseek-ai/DeepEP.git && cd DeepEP && git checkout a84a248 && \
+    cd /home/dpsk_a2a && \
+    wget https://developer.nvidia.com/downloads/assets/secure/nvshmem/nvshmem_src_3.2.5-1.txz && \
+    tar -xvf nvshmem_src_3.2.5-1.txz && mv nvshmem_src deepep-nvshmem && \
+    cd deepep-nvshmem && git apply /home/dpsk_a2a/DeepEP/third-party/nvshmem.patch && \
+    sed -i '16i#include <getopt.h>' /home/dpsk_a2a/deepep-nvshmem/examples/moe_shuffle.cu && \
+    sed -i 's/CUDA_STANDARD 11/CUDA_STANDARD 17/g' /home/dpsk_a2a/deepep-nvshmem/src/CMakeLists.txt
+
+ENV CUDA_HOME=/usr/local/cuda
+# Set MPI environment variables. Having errors when not set.
+ENV CPATH=/usr/local/mpi/include:$CPATH
+ENV LD_LIBRARY_PATH=/usr/local/mpi/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV GDRCOPY_HOME=/home/dpsk_a2a/gdrcopy
+
+# Build deepep-nvshmem
+WORKDIR /home/dpsk_a2a/deepep-nvshmem
+RUN NVSHMEM_SHMEM_SUPPORT=0 \
+    NVSHMEM_UCX_SUPPORT=0 \
+    NVSHMEM_USE_NCCL=0 \
+    NVSHMEM_MPI_SUPPORT=0 \
+    NVSHMEM_IBGDA_SUPPORT=1 \
+    NVSHMEM_PMIX_SUPPORT=0 \
+    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    NVSHMEM_BUILD_EXAMPLES=0 \
+    NVSHMEM_BUILD_TESTS=0 \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/home/dpsk_a2a/deepep-nvshmem/install -DCMAKE_CUDA_ARCHITECTURES=90 && cd build && make install -j && make clean
+
+# Build deepep
+WORKDIR /home/dpsk_a2a/DeepEP
+ENV NVSHMEM_DIR=/home/dpsk_a2a/deepep-nvshmem/install
+RUN NVSHMEM_DIR=/home/dpsk_a2a/deepep-nvshmem/install python setup.py install
+
+RUN pip3 install --no-cache-dir --no-deps trl
+
+RUN pip3 install nvtx matplotlib liger_kernel
+
+RUN pip install -U git+https://github.com/ISEEKYAN/mbridge.git
+
+RUN pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.14.0rc7
+
+RUN pip install git+https://github.com/volcengine/verl.git@v0.6.0
+
+RUN pip uninstall -y verl
+
+## RUN pip install git+https://github.com/NVIDIA/TensorRT-LLM.git@v1.2.0rc4
+
+WORKDIR /home/trtllm
+RUN git clone https://github.com/NVIDIA/TensorRT-LLM.git && \
+    pushd TensorRT-LLM && \
+    git checkout 6b5ebaae3ebccec && \
+    python3 scripts/build_wheel.py --no-venv -j $(nproc) --trt_root /usr/local/tensorrt && \
+    pip install . && \
+    rm -rf TensorRT-LLM && \
+    popd
