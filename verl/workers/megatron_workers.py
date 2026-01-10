@@ -533,6 +533,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
+        # two-phase initialization for rollout (rank already adjusted by WorkerDict/FusedWorker)
+        self.rollout.set_rank_adjusted(True)
+        self.rollout.init_worker()
+
         # 5. switch to trainer mode
         # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.

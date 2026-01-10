@@ -25,7 +25,14 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from verl.protocol import DataProto, _padding_size_key
-from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
+from verl.single_controller.base import (
+    ClassWithInitArgs,
+    ResourcePool,
+    TwoPhaseInitWorker,
+    Worker,
+    WorkerGroup,
+    WorkerMeta,
+)
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
 from verl.utils.device import get_device_name
 from verl.utils.py_functional import temp_env_var
@@ -460,12 +467,22 @@ class RayWorkerGroup(WorkerGroup):
     def _init_with_resource_pool(self, resource_pool, ray_cls_with_init, bin_pack, detached, worker_env=None):
         """Initialize the worker group by creating new workers from a resource pool.
 
+        This method handles the complete worker initialization process including:
+        1. Creating workers with placement group scheduling
+        2. Collecting worker metadata (IP, node_id, gpu_ids)
+        3. Sorting workers by IP for correct topology (driver node first)
+        4. Adjusting ranks, local_ranks and visible devices
+        5. Calling init_worker for actual initialization
+
         Args:
             resource_pool: Resource pool for worker allocation
             ray_cls_with_init: Class with initialization arguments for workers
             bin_pack: Whether to use strict bin packing for resource allocation
             detached: Whether workers should be detached
+            worker_env: Optional environment variables for workers
         """
+        from collections import defaultdict
+
         self.resource_pool = resource_pool
         pg = resource_pool.get_placement_group(device_name=self.device_name)
         world_size = resource_pool.world_size
@@ -473,12 +490,14 @@ class RayWorkerGroup(WorkerGroup):
         local_world_size = resource_pool.store[0]
         start_bundle_index = resource_pool.start_bundle_index
 
+        # Step 1: Create all workers
+        worker_meta_list: list[WorkerMeta] = []
         for rank in range(world_size):
             if rank == 0:
                 self._get_master_addr_port(pg, bundle_index=start_bundle_index)
 
             local_rank = rank % local_world_size
-            self._create_worker(
+            worker, worker_name = self._create_worker(
                 pg=pg,
                 bundle_index=start_bundle_index + rank,
                 rank=rank,
@@ -488,10 +507,75 @@ class RayWorkerGroup(WorkerGroup):
                 worker_env=worker_env,
                 detached=detached,
             )
+            worker_meta_list.append(WorkerMeta(worker=worker, worker_name=worker_name))
+
+        # Step 2: Collect worker metadata (IP, node_id, gpu_ids)
+        worker_cls = _unwrap_ray_remote(ray_cls_with_init.cls)
+        assert issubclass(worker_cls, TwoPhaseInitWorker), (
+            f"Two-phase initialization only supports TwoPhaseInitWorker, but got {worker_cls}"
+        )
+
+        worker_infos = ray.get([meta.worker.get_worker_info.remote() for meta in worker_meta_list])
+        for meta, (ip, node_id, gpu_ids) in zip(worker_meta_list, worker_infos, strict=True):
+            meta.ip = ip
+            meta.node_id = node_id
+            meta.gpu_ids = [int(x) for x in gpu_ids]
+
+        # Step 3: Sort workers by IP for correct topology
+        ip_counts: dict[str, int] = {}
+        for ip, _, _ in worker_infos:
+            ip_counts[ip] = ip_counts.get(ip, 0) + 1
+
+        def sort_by_master_then_worker_ip(item: WorkerMeta):
+            """
+            Sort the workers based on 3 properties:
+            1. If the worker is on the same node as the master,
+                it should be placed first.
+            2. Then, if the worker is on a node with fewer workers, it should
+                be placed first.
+            3. Finally, if the worker is on a node with smaller IP address, it
+                should be placed first.
+            """
+            ip = item.ip
+            return (0 if ip == self._master_addr else 1, ip_counts[ip], ip)
+
+        sorted_worker_meta = sorted(worker_meta_list, key=sort_by_master_then_worker_ip)
+
+        # Step 4: Build final workers list
+        self._workers = [item.worker for item in sorted_worker_meta]
+        self._worker_names = [item.worker_name for item in sorted_worker_meta]
+
+        # Step 5: Build node_workers and node_gpus mappings
+        node_workers: dict[str, list[int]] = defaultdict(list)  # node id -> list of worker ranks
+        node_gpus: dict[str, list[int]] = defaultdict(list)  # node id -> list of gpu ids
+
+        for rank, item in enumerate(sorted_worker_meta):
+            node_workers[item.node_id].append(rank)
+            node_gpus[item.node_id].extend(item.gpu_ids)
+
+        for node_id, gpu_ids in node_gpus.items():
+            node_gpus[node_id] = sorted(set(gpu_ids))
+
+        # Step 6: Adjust rank, local_rank and visible_devices for each worker
+        adjust_rank_futures = []
+        for rank, item in enumerate(sorted_worker_meta):
+            local_rank = node_workers[item.node_id].index(rank)
+            visible_devices = str(node_gpus[item.node_id][local_rank])
+            future = item.worker.adjust_rank.remote(rank, 0, visible_devices)
+            adjust_rank_futures.append(future)
+        ray.get(adjust_rank_futures)
+
+        # Step 7: Initialize all workers
+        ray.get([item.worker.init_worker.remote() for item in sorted_worker_meta])
 
     def _create_worker(
         self, pg, bundle_index, rank, local_rank, resource_pool, ray_cls_with_init, worker_env, detached
     ):
+        """Create a single worker actor.
+
+        Returns:
+            tuple: (worker_handle, worker_name)
+        """
         world_size = resource_pool.world_size
         use_gpu = resource_pool.use_gpu
         local_world_size = resource_pool.store[0]
@@ -523,6 +607,7 @@ class RayWorkerGroup(WorkerGroup):
         match = re.search(r"ActorClass\(([^)]+)\)", cia_name)  # ray.remote(Obj) -> "ActorClass(Obj)"
         cia_name = match.group(1) if match else cia_name  # "ActorClass(Obj)" -> "Obj"
         pg_idx = rank // local_world_size
+        # TODO: worker_name may be inaccurate after adjust_rank, need to fix
         name = f"{self.name_prefix}{cia_name}_{pg_idx}:{local_rank}"  # e.g. Worker_2:5
 
         if self.profile_steps and self.device_name == "cuda":
@@ -549,8 +634,7 @@ class RayWorkerGroup(WorkerGroup):
             num_gpus=num_gpus,
             device_name=self.device_name,
         )
-        self._workers.append(worker)
-        self._worker_names.append(name)
+        return worker, name
 
     @property
     def worker_names(self):
@@ -875,18 +959,44 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     assert cls_dict.keys() == init_args_dict.keys()
 
     # TODO: create a class with customizable name
-    class WorkerDict(worker_cls):
+    class WorkerDict(worker_cls, TwoPhaseInitWorker):
         def __init__(self):
-            super().__init__()
+            worker_cls.__init__(self)
+            TwoPhaseInitWorker.__init__(self)
             self.worker_dict = {}
-            for key, user_defined_cls in cls_dict.items():
+            # Store initialization parameters for deferred initialization
+            self._cls_dict = cls_dict
+            self._init_args_dict = init_args_dict
+
+        def adjust_rank(self, rank: int, local_rank: int, visible_devices: str):
+            """Adjust the rank, local_rank and visible devices for this WorkerDict.
+
+            Note: Sub-workers inherit environment variables from this WorkerDict,
+            so no need to call adjust_rank on them.
+
+            Args:
+                rank: The new global rank for this worker.
+                local_rank: The new local rank for this worker.
+                visible_devices: The comma-separated visible device IDs for this worker.
+            """
+            TwoPhaseInitWorker.adjust_rank(self, rank, local_rank, visible_devices)
+
+        def init_worker(self):
+            """Initialize all sub-workers after rank adjustment.
+
+            This creates and initializes all sub-workers in the worker_dict.
+            """
+            TwoPhaseInitWorker.init_worker(self)
+
+            # Now initialize all sub-workers with adjusted environment variables
+            for key, user_defined_cls in self._cls_dict.items():
                 user_defined_cls = _unwrap_ray_remote(user_defined_cls)
                 # directly instantiate the class without remote
                 # in worker class, e.g. <verl.single_controller.base.worker.Worker>
                 # when DISABLE_WORKER_INIT == 1 it will return immediately
                 with temp_env_var("DISABLE_WORKER_INIT", "1"):
                     self.worker_dict[key] = user_defined_cls(
-                        *init_args_dict[key].get("args", ()), **init_args_dict[key].get("kwargs", {})
+                        *self._init_args_dict[key].get("args", ()), **self._init_args_dict[key].get("kwargs", {})
                     )
 
     # now monkey-patch the methods from inner class to WorkerDict
@@ -928,14 +1038,36 @@ def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs])
     # FusedWorker_Actor_Critic
     class_name_renamed = "_".join([FusedWorkerCLSName] + cls_names)
 
-    class FusedWorker(Worker):
+    class FusedWorker(Worker, TwoPhaseInitWorker):
         def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+            Worker.__init__(self, *args, **kwargs)
+            TwoPhaseInitWorker.__init__(self)
             self.cls_names = cls_names
             self.raw_cls_dict = raw_cls_dict
             self.init_args_dict = init_args_dict
             self.init_kwargs_dict = init_kwargs_dict
 
+        def adjust_rank(self, rank: int, local_rank: int, visible_devices: str):
+            """Adjust the rank, local_rank and visible devices for this FusedWorker.
+
+            Note: Sub-workers inherit environment variables from this FusedWorker,
+            so no need to call adjust_rank on them.
+
+            Args:
+                rank: The new global rank for this worker.
+                local_rank: The new local rank for this worker.
+                visible_devices: The comma-separated visible device IDs for this worker.
+            """
+            TwoPhaseInitWorker.adjust_rank(self, rank, local_rank, visible_devices)
+
+        def init_worker(self):
+            """Initialize all sub-workers after rank adjustment.
+
+            This creates and initializes all sub-workers in the fused_worker_dict.
+            """
+            TwoPhaseInitWorker.init_worker(self)
+
+            # Initialize all sub-workers with adjusted environment variables
             for cls_name, udc, ud_args, ud_kwargs in zip(
                 self.cls_names,
                 self.raw_cls_dict.values(),
@@ -955,6 +1087,7 @@ def create_colocated_worker_raw_cls(class_dict: dict[str, RayClassWithInitArgs])
                 setattr(worker, Worker.fused_worker_attr_name, self.fused_worker_dict)
 
         def _fuw_execute(self, method_name: str, *args, **kwargs):
+            assert TwoPhaseInitWorker.is_rank_adjusted(self), "FusedWorker must adjust_rank before _fuw_execute"
             # for fused_worker, method_name is in a form of "{cls_name}_fwmn_{method_name}"
             # where fwmn stands "fused worker method name"
             names = method_name.split("_fwmn_")

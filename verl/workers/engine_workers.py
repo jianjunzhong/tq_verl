@@ -512,6 +512,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
             )
 
+            # 3.4 two-phase initialization for rollout (rank already adjusted by WorkerDict/FusedWorker)
+            self.rollout.set_rank_adjusted(True)
+            self.rollout.init_worker()
+
             # used for LoRA
             self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
             self.layered_summon = self.config.rollout.get("layered_summon", False)

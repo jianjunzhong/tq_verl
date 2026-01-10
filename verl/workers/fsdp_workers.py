@@ -652,6 +652,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
+        # two-phase initialization for rollout (rank already adjusted by WorkerDict/FusedWorker)
+        self.rollout.set_rank_adjusted(True)
+        self.rollout.init_worker()
+
         # Full params
         if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
             FSDP.set_state_dict_type(
@@ -1217,7 +1221,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
                 init_method=os.environ.get("DIST_INIT_METHOD", None),
             )
-        self.config: FSDPCriticConfig = config
 
         # build device mesh for Ulysses Sequence Parallel
         world_size = torch.distributed.get_world_size()

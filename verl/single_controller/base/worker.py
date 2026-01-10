@@ -32,6 +32,17 @@ from .decorator import Dispatch, Execute, register
 
 
 @dataclass
+class WorkerMeta:
+    """Metadata for a worker, used for sorting and rank adjustment."""
+
+    worker: "ray.actor.ActorHandle"
+    worker_name: str = ""
+    ip: str = ""
+    node_id: str = ""
+    gpu_ids: list = None
+
+
+@dataclass
 class DistRankInfo:
     tp_rank: int
     dp_rank: int
@@ -70,6 +81,107 @@ class WorkerHelper:
 
     def get_available_master_addr_port(self):
         return self._get_node_ip().strip("[]"), str(self._get_free_port())
+
+    @staticmethod
+    def get_worker_info() -> tuple[str, str, list[int]]:
+        """Get the IP address, node ID and GPU IDs for this worker.
+
+        Returns:
+            tuple: A tuple of (ip, node_id, gpu_ids) where:
+                - ip is the IP address of the node
+                - node_id is the Ray node ID
+                - gpu_ids is a list of GPU IDs assigned to this worker
+        """
+        from verl.utils.device import get_ray_device_key
+
+        ip = WorkerHelper._get_node_ip()
+        node_id = ray.get_runtime_context().get_node_id()
+        device_key = get_ray_device_key()
+        if not device_key:
+            raise RuntimeError(f"Current platform does not support Ray accelerators. Device key: {device_key}")
+        gpu_ids = ray.get_runtime_context().get_accelerator_ids()[device_key]
+        return ip, node_id, gpu_ids
+
+
+class TwoPhaseInitWorker(WorkerHelper):
+    """Base class for all workers that provides two-phase initialization.
+
+    This class provides basic rank adjustment and initialization methods that are
+    required by RayWorkerGroup for IP-based worker sorting. Worker containers
+    (WorkerDict, FusedWorker, BaseRollout) should inherit from this class.
+
+    Two-phase initialization:
+        1. __init__: Only store parameters, do NOT initialize heavy resources
+        2. init_worker: Called after rank adjustment, initialize resources here
+    """
+
+    def __init__(self) -> None:
+        """Initialize the worker base with rank adjustment flag."""
+        self._rank_adjusted = False
+
+    def adjust_rank(self, rank: int, local_rank: int, visible_devices: str):
+        """Adjust the worker's rank, local_rank and visible devices after IP-based sorting.
+
+        This method is called after workers are sorted by IP to ensure correct
+        topology. It updates the rank-related environment variables.
+
+        Args:
+            rank: The new global rank for this worker.
+            local_rank: The new local rank for this worker.
+            visible_devices: The comma-separated visible device IDs for this worker.
+        """
+        import os
+
+        # Update environment variables
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
+        # Update device visibility environment variable
+        device_keyword = get_visible_devices_keyword().upper()
+        os.environ[device_keyword] = visible_devices
+
+        # Mark that rank adjustment has been done
+        self._rank_adjusted = True
+
+    def init_worker(self):
+        """Initialize the worker after rank adjustment.
+
+        This method should be overridden by subclasses to perform initialization
+        that depends on the correct rank assignment. The __init__ method should
+        only store passed parameters as class attributes, and actual initialization
+        (like torch.distributed.init_process_group) should be done in this method.
+
+        This is called after workers are created and their ranks are adjusted based
+        on IP sorting to ensure correct topology.
+
+        Note:
+            Subclasses must call super().init_worker() at the beginning of their
+            implementation to ensure adjust_rank has been called.
+
+        Raises:
+            RuntimeError: If adjust_rank has not been called before this method.
+        """
+        if not self._rank_adjusted:
+            raise RuntimeError(
+                "init_worker() called before adjust_rank(). "
+                "adjust_rank() must be called first to ensure correct rank assignment."
+            )
+
+    def set_rank_adjusted(self, adjusted: bool):
+        """Set the rank adjustment flag.
+
+        Args:
+            adjusted: Whether rank adjustment has been completed.
+        """
+        self._rank_adjusted = adjusted
+
+    def is_rank_adjusted(self) -> bool:
+        """Check if rank adjustment has been completed.
+
+        Returns:
+            bool: True if topology adjustment has been completed, False otherwise.
+        """
+        return self._rank_adjusted
 
 
 # we assume that in each WorkerGroup, there is a Master Worker
