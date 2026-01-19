@@ -125,6 +125,7 @@ class TwoPhaseInitWorker(WorkerHelper):
 
     def __init__(self) -> None:
         """Initialize the worker base with environment setup flag."""
+        self.worker_meta: WorkerMeta = None
         self._environment_setup = False
 
     def setup_worker_environment(
@@ -199,6 +200,22 @@ class TwoPhaseInitWorker(WorkerHelper):
             bool: True if environment setup has been completed, False otherwise.
         """
         return self._environment_setup
+
+    def set_worker_meta(self, worker_meta: WorkerMeta):
+        """Set the metadata of this worker.
+
+        Args:
+            worker_meta (WorkerMeta): The metadata to set for this worker.
+        """
+        self.worker_meta = worker_meta
+
+    def get_worker_meta(self) -> WorkerMeta:
+        """Get the metadata of this worker.
+
+        Returns:
+            WorkerMeta: The metadata of this worker.
+        """
+        return self.worker_meta
 
 
 # we assume that in each WorkerGroup, there is a Master Worker

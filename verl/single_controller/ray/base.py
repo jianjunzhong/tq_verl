@@ -565,6 +565,7 @@ class RayWorkerGroup(WorkerGroup):
             worker_meta_list.append(
                 WorkerMeta(worker=worker, worker_name=worker_name, bundle_index=start_bundle_index + rank)
             )
+            worker.set_worker_meta.remote(worker_meta_list[-1])
 
         if not use_gpu:
             self._workers = [item.worker for item in worker_meta_list]
@@ -715,6 +716,7 @@ class RayWorkerGroup(WorkerGroup):
     @classmethod
     def from_detached(
         cls,
+        resource_pool=None,
         name_prefix=None,
         worker_names=None,
         worker_handles=None,
@@ -732,11 +734,12 @@ class RayWorkerGroup(WorkerGroup):
             A new RayWorkerGroup instance
         """
         worker_group = cls(
-            resource_pool=None,
+            resource_pool=resource_pool,
             ray_cls_with_init=ray_cls_with_init,
             name_prefix=name_prefix,
             worker_names=worker_names,
             worker_handles=worker_handles,
+            from_detached=True,
             **kwargs,
         )
         return worker_group
@@ -764,6 +767,7 @@ class RayWorkerGroup(WorkerGroup):
         new_worker_group_dict = {}
         for prefix in prefix_set:
             new_worker_group = self.from_detached(
+                resource_pool=self.resource_pool,
                 name_prefix=self.name_prefix,
                 worker_names=self._worker_names,
                 worker_handles=self._workers,

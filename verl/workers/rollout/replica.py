@@ -120,6 +120,7 @@ class RolloutReplica(ABC):
             worker_group: RayWorkerGroup, fused workers where training engine(fsdp/megatron) have been initialized.
         """
         self.rollout_mode = RolloutMode.HYBRID
+        self.resource_pool = worker_group.resource_pool
         self.workers = worker_group.workers[
             self.world_size * self.replica_rank : self.world_size * (self.replica_rank + 1)
         ]
@@ -134,6 +135,7 @@ class RolloutReplica(ABC):
             resource_pool: RayResourcePool, ray placement group where hybrid engine processes have been launched.
         """
         self.rollout_mode = RolloutMode.COLOCATED
+        self.resource_pool = worker_group.resource_pool
         self.workers = worker_group.workers[
             self.world_size * self.replica_rank : self.world_size * (self.replica_rank + 1)
         ]

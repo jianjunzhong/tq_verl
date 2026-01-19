@@ -129,15 +129,10 @@ class WorkerGroup:
     fused_worker_execute_fn_name = "_fuw_execute"
 
     def __init__(self, resource_pool: ResourcePool, **kwargs) -> None:
-        self._is_init_with_detached_workers = resource_pool is None
+        self.resource_pool = resource_pool
+        self._is_init_with_detached_workers = kwargs.get("from_detached", resource_pool is None)
 
         self.fused_worker_used = False
-
-        if resource_pool is not None:
-            # handle the case when WorkGroup is attached to an existing one
-            self._procecss_dispatch_config = resource_pool()
-        else:
-            self._procecss_dispatch_config = None
 
         self._workers = []
         self._worker_names = []
