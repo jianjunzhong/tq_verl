@@ -216,11 +216,19 @@ class vLLMColocateWorkerExtension:
                 tensor = buffer[offset : offset + size].view(dtype=dtype).view(shape)
                 if not use_shm:
                     tensor = tensor.clone()
-                else:
-                    tensor = tensor.to(self.device)
                 weights.append((name, tensor))
             get_torch_device().synchronize()
             socket.send(b"")
+
+            # move weights to device after send ack for overlapping
+            # parameter gathering in ServerAdapter
+            if use_shm:
+                on_device_weights = []
+                for name, tensor in weights:
+                    on_device_weights.append((name, tensor.to(self.device, non_blocking=True)))
+                    del tensor
+                weights = on_device_weights
+
             self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
             del weights
             if metadata["is_last"]:

@@ -168,9 +168,11 @@ class ServerAdapter(BaseRollout):
         s = self.zmq_context.socket(zmq.REQ)
         s.bind(self.zmq_handle)
 
+        buffer_size = 0
         buffer, shm = None, None
         if not self.use_shm:
-            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:0")
+            buffer_size = bucket_size
+            buffer = torch.empty(buffer_size, dtype=torch.uint8, device=f"{get_device_name()}:0")
             handle = reduce_tensor(buffer)
             s.send_pyobj(handle)
         else:
@@ -179,34 +181,38 @@ class ServerAdapter(BaseRollout):
 
             # Create unique name for shared memory
             shm_name = f"verl_weights_{uuid.uuid4().hex}"
-            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=bucket_size)
+            buffer_size = bucket_size * 2
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=buffer_size)
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
 
-            comm_metadata = {"name": shm_name, "size": bucket_size}
+            comm_metadata = {"name": shm_name, "size": buffer_size}
             s.send_pyobj(comm_metadata)
 
         s.recv()
 
         # send bucket weights
-        offset = 0
+        start_offset, offset = 0, 0
         bucket_meta: dict[str, TensorMetadata] = {}
         dtype = PrecisionType.to_dtype(self.config.dtype)
+        gidx = 0
         async for name, weight in ensure_async_iterator(weights):
             # model parameters are in fp32 full precision
             weight = weight.to(dtype, non_blocking=True)
 
             # fill the tensor bucket
-            if offset + weight.nbytes > bucket_size:
+            if offset + weight.nbytes - start_offset > bucket_size:
                 get_torch_device().synchronize()
+                gidx += 1
                 s.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
                 s.recv()
                 bucket_meta = {}
-                offset = 0
+                start_offset = 0 if not self.use_shm else gidx % 2 * bucket_size
+                offset = 0 + start_offset
 
             # TODO: slice embedding layer weight into chunks
-            assert offset + weight.nbytes <= bucket_size, (
+            assert offset + weight.nbytes - start_offset <= bucket_size, (
                 f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-                f"Please increase rollout.update_weights_bucket_megabytes({bucket_size_mb} MB)."
+                f"Please increase rollout.checkpoint_engine.update_weights_bucket_megabytes({bucket_size_mb} MB)."
             )
             bucket_meta[name] = {
                 "name": name,
