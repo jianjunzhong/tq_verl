@@ -59,6 +59,7 @@ from verl.utils.megatron.router_replay_utils import (
 from verl.utils.megatron.tensor_parallel import (
     vocab_parallel_entropy,
     vocab_parallel_entropy_with_chunking,
+    vocab_parallel_log_probs_and_entropy_with_chunking,
     vocab_parallel_log_probs_from_logits,
     vocab_parallel_sum_pi_squared,
 )
@@ -1202,7 +1203,23 @@ class MegatronEngineWithLMHead(MegatronEngine):
         # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
         if calculate_sum_pi_squared:
             ret["sum_pi_squared"] = vocab_parallel_sum_pi_squared(logits)
-        if calculate_entropy:
+        # Joint chunked log_probs + entropy path: avoids the full logits clone and
+        # computes both outputs with one fused op per chunk. Only valid when no
+        # distillation student logits are needed from the pristine logits copy.
+        log_probs_computed = False
+        if (
+            calculate_entropy
+            and self.engine_config.entropy_from_logits_with_chunking
+            and not distillation_use_topk
+            and not distillation_only
+        ):
+            ret["log_probs"], ret["entropy"] = vocab_parallel_log_probs_and_entropy_with_chunking(
+                logits,
+                label,
+                chunk_size=self.engine_config.entropy_from_logits_chunk_size,
+            )
+            log_probs_computed = True
+        elif calculate_entropy:
             logits_bak = logits.clone()
             # # disable the hint until the fused_kernel is optimized for triton>=3.3
             # if torch.distributed.get_rank() == 0:
@@ -1226,7 +1243,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
         if distillation_use_topk:
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
-        if not distillation_only:
+        if not distillation_only and not log_probs_computed:
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
         return ret

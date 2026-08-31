@@ -170,6 +170,121 @@ def vocab_parallel_entropy_with_chunking(vocab_parallel_logits: torch.Tensor, ch
     return entropy
 
 
+class _VocabParallelLogProbsAndEntropy(torch.autograd.Function):
+    """Compute log-probs and entropy jointly for one chunk of TP-sharded logits.
+
+    Unlike calling ``vocab_parallel_log_probs_from_logits`` and
+    ``vocab_parallel_entropy`` back-to-back, this shares the numerically-stable
+    intermediates (``logits_max`` and ``sum_exp``) between the two outputs, so a
+    single chunk only performs 4 TP all-reduces instead of 6. The implementation
+    computes in fp32 (matching ``vocab_parallel_cross_entropy`` and the FSDP
+    entropy path) and does not mutate its input in either forward or backward.
+    """
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = vocab_parallel_logits.float()
+        tp_group = mpu.get_tensor_model_parallel_group()
+
+        # Shared stable-max normalisation.
+        logits_max = logits.max(dim=-1, keepdim=True).values
+        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
+        shifted = logits - logits_max
+        exp_shifted = shifted.exp()
+        sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_exp, group=tp_group)
+        logsumexp = logits_max + sum_exp.log()
+        softmax = exp_shifted / sum_exp
+
+        # Log-probs: gather the target logit from the owning TP partition and
+        # all-reduce the (masked) contributions, mirroring vocab_parallel_cross_entropy.
+        vocab_start = mpu.get_tensor_model_parallel_rank() * vocab_parallel_logits.size(-1)
+        target_mask = (labels < vocab_start) | (labels >= vocab_start + vocab_parallel_logits.size(-1))
+        masked_target = labels.clone() - vocab_start
+        masked_target[target_mask] = 0
+        predicted_logits = torch.gather(logits, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+        predicted_logits = predicted_logits.masked_fill(target_mask, 0.0)
+        dist.all_reduce(predicted_logits, group=tp_group)
+        log_probs = predicted_logits - logsumexp.squeeze(-1)
+
+        # Entropy: logsumexp - sum(softmax * logits).
+        sum_softmax_times_logits = (softmax * logits).sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_softmax_times_logits, group=tp_group)
+        entropy = (logsumexp - sum_softmax_times_logits).squeeze(-1)
+
+        ctx.input_dtype = vocab_parallel_logits.dtype
+        ctx.save_for_backward(logits, softmax, logsumexp, entropy, masked_target, target_mask)
+        return log_probs, entropy
+
+    @staticmethod
+    def backward(ctx, grad_log_probs: torch.Tensor, grad_entropy: torch.Tensor) -> tuple[torch.Tensor, None]:
+        logits, softmax, logsumexp, entropy, masked_target, target_mask = ctx.saved_tensors
+
+        # d log_probs / d logits = onehot(label) - softmax
+        # d entropy   / d logits = softmax * (logsumexp - entropy - logits)
+        onehot = torch.zeros_like(softmax)
+        onehot.scatter_(-1, masked_target.unsqueeze(-1), 1.0)
+        onehot = onehot.masked_fill(target_mask.unsqueeze(-1), 0.0)
+
+        grad_logits = torch.zeros_like(logits)
+        if grad_log_probs is not None:
+            grad_logits = grad_logits + grad_log_probs.unsqueeze(-1) * (onehot - softmax)
+        if grad_entropy is not None:
+            grad_logits = grad_logits + grad_entropy.unsqueeze(-1) * softmax * (
+                logsumexp - entropy.unsqueeze(-1) - logits
+            )
+
+        return grad_logits.to(ctx.input_dtype), None
+
+
+def vocab_parallel_log_probs_and_entropy_with_chunking(
+    vocab_parallel_logits: torch.Tensor,
+    labels: torch.Tensor,
+    chunk_size: int = 2048,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute log_probs and entropy with token-dimension chunking.
+
+    The eager ``_lm_head_logits_processor`` path clones the *full* logits tensor
+    once so that ``vocab_parallel_entropy`` and
+    ``vocab_parallel_log_probs_from_logits`` can consume disjoint tensors. For a
+    large vocabulary that full clone is a common OOM source. This function
+    processes the sequence dimension in chunks with a fused
+    :class:`_VocabParallelLogProbsAndEntropy` op and returns results equivalent
+    to the two individual calls.
+
+    Args:
+        vocab_parallel_logits: (..., seq_len, vocab_size // tp_size)
+        labels: (..., seq_len)
+        chunk_size: Number of sequence tokens to process at once. Defaults to 2048.
+
+    Returns:
+        (log_probs, entropy). ``log_probs`` has dtype float32; ``entropy`` has
+        dtype ``vocab_parallel_logits.dtype``.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if vocab_parallel_logits.shape[:-1] != labels.shape:
+        raise ValueError(
+            f"logits leading shape {vocab_parallel_logits.shape[:-1]} must match "
+            f"labels shape {labels.shape}"
+        )
+
+    log_probs = torch.empty(labels.shape, dtype=torch.float32, device=vocab_parallel_logits.device)
+    entropy = torch.empty(labels.shape, dtype=vocab_parallel_logits.dtype, device=vocab_parallel_logits.device)
+    seq_dim = vocab_parallel_logits.dim() - 2
+    seq_len = vocab_parallel_logits.shape[seq_dim]
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        logits_chunk = vocab_parallel_logits.narrow(seq_dim, start, end - start)
+        labels_chunk = labels.narrow(seq_dim, start, end - start)
+        log_probs_chunk, entropy_chunk = _VocabParallelLogProbsAndEntropy.apply(logits_chunk, labels_chunk)
+        log_probs.narrow(seq_dim, start, end - start).copy_(log_probs_chunk)
+        entropy.narrow(seq_dim, start, end - start).copy_(entropy_chunk.to(vocab_parallel_logits.dtype))
+
+    return log_probs, entropy
+
+
 def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     """Compute Σπ² (sum of squared probabilities) when logits are sharded across tp ranks.
 

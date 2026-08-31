@@ -19,6 +19,8 @@ torchrun --nproc-per-node=4 --standalone tests/special_distributed/test_tensor_d
 torchrun --nproc-per-node=4 --standalone tests/special_distributed/test_torch_functional.py
 torchrun --nproc-per-node=4 --standalone -m pytest -svv \
     tests/special_distributed/test_megatron_dynamic_cp_features.py
+torchrun --nproc-per-node=2 --standalone -m pytest -svv \
+    tests/special_distributed/test_megatron_log_probs_entropy_chunking.py
 # Regression for verl#5995 (FSDP2 + CPUOffloadPolicy state_dict crash). Only
 # needs 2 ranks to exercise CPUOffloadPolicy sharding.
 torchrun --nproc-per-node=2 --standalone tests/special_distributed/test_fsdp2_cpu_offload_state_dict.py
