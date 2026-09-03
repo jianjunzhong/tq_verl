@@ -180,11 +180,13 @@ class _VocabParallelLogProbsAndEntropy(torch.autograd.Function):
     computes in fp32 (matching ``vocab_parallel_cross_entropy`` and the FSDP
     entropy path) and does not mutate its input in either forward or backward.
 
-    Only the fp32 ``logits`` chunk (plus small per-token tensors) is saved for
-    backward; ``softmax`` is recomputed as ``(logits - logsumexp).exp()`` in
-    backward. This halves the persistent saved activations (8 -> 4 bytes/element
-    across the full sequence) at the cost of one elementwise exp per chunk,
-    with a measured relative drift of ~2e-6 in fp32 — far below bf16 resolution.
+    Only the low-precision ``vocab_parallel_logits`` chunk (plus small per-token
+    tensors) is saved for backward; the fp32 logits are recomputed from it with
+    an exact upcast (bf16/fp16 -> fp32 is lossless) and ``softmax`` is then
+    recomputed as ``(logits - logsumexp).exp()``. This keeps the persistent
+    saved activations at the input dtype (2 bytes/element for bf16 across the
+    full sequence) at the cost of one cast and one elementwise exp per chunk,
+    with zero additional numerical drift versus saving fp32 logits.
     """
 
     @staticmethod
@@ -219,30 +221,40 @@ class _VocabParallelLogProbsAndEntropy(torch.autograd.Function):
         entropy = (logsumexp - sum_softmax_times_logits).squeeze(-1)
 
         ctx.input_dtype = vocab_parallel_logits.dtype
-        ctx.save_for_backward(logits, logsumexp, entropy, masked_target, target_mask)
+        ctx.save_for_backward(vocab_parallel_logits, logsumexp, entropy, masked_target, target_mask)
         return log_probs, entropy
 
     @staticmethod
     def backward(ctx, grad_log_probs: torch.Tensor, grad_entropy: torch.Tensor) -> tuple[torch.Tensor, None]:
-        logits, logsumexp, entropy, masked_target, target_mask = ctx.saved_tensors
+        vocab_parallel_logits, logsumexp, entropy, masked_target, target_mask = ctx.saved_tensors
 
-        # Recompute softmax instead of saving it: exp(shifted) / sum_exp
-        # == exp(logits - (logits_max + log(sum_exp))) = exp(logits - logsumexp).
-        softmax = (logits - logsumexp).exp()
+        # Recompute the fp32 logits from the saved low-precision input. The
+        # upcast is exact (bf16/fp16 values are representable in fp32), so this
+        # is bit-identical to saving the fp32 logits at half the persistent bytes.
+        logits = vocab_parallel_logits.float()
 
-        # d log_probs / d logits = onehot(label) - softmax
-        # d entropy   / d logits = softmax * (logsumexp - entropy - logits)
-        onehot = torch.zeros_like(softmax)
-        onehot.scatter_(-1, masked_target.unsqueeze(-1), 1.0)
-        onehot = onehot.masked_fill(target_mask.unsqueeze(-1), 0.0)
+        # t = logits - logsumexp is the log-softmax; softmax is recomputed from
+        # it and the entropy term reuses it: logsumexp - entropy - logits == -(t + entropy).
+        t = logits - logsumexp
+        softmax = t.exp()
 
-        grad_logits = torch.zeros_like(logits)
-        if grad_log_probs is not None:
-            grad_logits = grad_logits + grad_log_probs.unsqueeze(-1) * (onehot - softmax)
+        # Dense part: d/dlogits = softmax * (-grad_entropy * (t + entropy) - grad_log_probs),
+        # accumulated in place into t and then softmax (both freshly allocated above,
+        # so in-place mutation is safe).
         if grad_entropy is not None:
-            grad_logits = grad_logits + grad_entropy.unsqueeze(-1) * softmax * (
-                logsumexp - entropy.unsqueeze(-1) - logits
-            )
+            t.add_(entropy.unsqueeze(-1))
+            t.mul_(-grad_entropy.unsqueeze(-1))
+            if grad_log_probs is not None:
+                t.sub_(grad_log_probs.unsqueeze(-1))
+        else:
+            t = -grad_log_probs.unsqueeze(-1)
+        grad_logits = softmax.mul_(t)
+
+        # Sparse part: the onehot(label) contribution of log_probs, added only on
+        # the TP partition owning the label (masked rows contribute nothing).
+        if grad_log_probs is not None:
+            src = grad_log_probs.masked_fill(target_mask, 0.0)
+            grad_logits.scatter_add_(-1, masked_target.unsqueeze(-1), src.unsqueeze(-1))
 
         return grad_logits.to(ctx.input_dtype), None
 

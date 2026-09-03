@@ -109,6 +109,52 @@ def test_backward_matches_individual_calls(shape):
     torch.testing.assert_close(fused.grad, ref_grad, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("which", ["log_probs", "entropy"])
+def test_backward_single_output_grad(which):
+    """Backward with only one output receiving a gradient (the other is None)."""
+    torch.manual_seed(4)
+    shape = (2, 6, 8)
+    labels = torch.randint(0, 8, shape[:-1])
+    base = torch.randn(*shape, dtype=torch.float32)
+
+    ref = base.clone().requires_grad_(True)
+    log_probs_ref, entropy_ref = _reference(ref, labels)
+    (log_probs_ref if which == "log_probs" else entropy_ref).sum().backward()
+    ref_grad = ref.grad
+
+    fused = base.clone().requires_grad_(True)
+    log_probs, entropy = vocab_parallel_log_probs_and_entropy_with_chunking(fused, labels, chunk_size=3)
+    (log_probs if which == "log_probs" else entropy).sum().backward()
+
+    torch.testing.assert_close(fused.grad, ref_grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_backward_low_precision_input(dtype):
+    """Backward recomputes the fp32 logits from the saved low-precision input.
+
+    The upcast is exact, so the gradient must match a reference computed from
+    the same low-precision values upcast to fp32.
+    """
+    torch.manual_seed(5)
+    shape = (2, 6, 8)
+    labels = torch.randint(0, 8, shape[:-1])
+    base = torch.randn(*shape, dtype=dtype)
+
+    ref = base.clone().float().requires_grad_(True)
+    log_probs_ref, entropy_ref = _reference(ref, labels)
+    (log_probs_ref.sum() + entropy_ref.sum()).backward()
+    ref_grad = ref.grad
+
+    fused = base.clone().requires_grad_(True)
+    log_probs, entropy = vocab_parallel_log_probs_and_entropy_with_chunking(fused, labels, chunk_size=3)
+    (log_probs.sum() + entropy.sum()).backward()
+
+    # The gradient is returned in the input dtype; compare against the reference
+    # rounded to that dtype (tolerates one rounding-boundary ulp flip).
+    torch.testing.assert_close(fused.grad, ref_grad.to(dtype))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_dtype_contract(dtype):
     torch.manual_seed(2)
