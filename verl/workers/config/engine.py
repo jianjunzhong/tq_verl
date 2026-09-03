@@ -177,6 +177,11 @@ class McoreEngineConfig(EngineConfig):
         pad_to_length (bool): Whether to round every packed micro-batch up to a bucket-aligned length.
         pad_to_length_bucket (int): Padding granularity on the global packed sequence.
         dtype (str): Mixed precision training param dtype, default "bfloat16"
+        entropy_from_logits_with_chunking (bool): Whether to compute entropy and log-probs from logits
+            jointly in sequence-dimension chunks with a fused op, avoiding the full-size logits clone for
+            large vocabularies. Only applies when entropy is computed (actor training) on the
+            non-fused-kernels path (``use_fused_kernels=False``).
+        entropy_from_logits_chunk_size (int): Number of sequence tokens per chunk. Default: 2048.
     """
 
     # sequence_parallel is not listed as a frozen field for auto-correction purpose

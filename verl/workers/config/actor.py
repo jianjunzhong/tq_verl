@@ -265,6 +265,12 @@ class McoreActorConfig(ActorConfig):
 
     Args:
         strategy (str): Training strategy set to 'megatron' for Megatron parallelism.
+        entropy_from_logits_with_chunking (bool): Whether to compute entropy and log-probs from logits
+            jointly in chunks with a fused op, avoiding the full-size logits clone for large vocabularies.
+            Unlike the FSDP backend (where this flag only chunks entropy), on Megatron it also chunks the
+            log-probs computation. Only applies when entropy is computed (actor training) on the
+            non-fused-kernels path (``use_fused_kernels=False``).
+        entropy_from_logits_chunk_size (int): Number of sequence tokens per chunk. Default: 2048.
         megatron (dict[str, Any]): Configuration for Megatron parallelism settings.
         profile (dict[str, Any]): Configuration for profiling settings.
         checkpoint (McoreCheckpointConfig): Megatron-specific checkpoint config

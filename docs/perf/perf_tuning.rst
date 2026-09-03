@@ -252,8 +252,13 @@ Memory optimization for entropy calculation from logits
 The ``logits`` tensor (typically of shape ``[bsz*seq_len, voc]``) can consume significant memory. When using ``compute_entropy_from_logits``, memory usage reaches approximately ``[bsz*seq_len, voc] × (4 bytes (float32) + 2 bytes (autocast for softmax+logsumexp) + 1 byte (softmax output))``.
 
 To reduce this memory peak, enable chunked computation by setting:
-``actor_rollout_ref.ref.entropy_from_logits_with_chunking = True``
-This processes the tensor in chunks of shape ``[chunk_size, voc]`` (e.g., 2048) rather than the full sequence length, exclusively during the model's forward pass.
+``actor_rollout_ref.actor.entropy_from_logits_with_chunking = True``
+This processes the tensor in chunks of shape ``[chunk_size, voc]`` (configurable via ``entropy_from_logits_chunk_size``, default 2048) rather than the full sequence length, exclusively during the model's forward pass.
+
+.. note::
+   This flag only takes effect where entropy is actually computed, i.e. during actor training. The ref model only computes log-probs (``calculate_entropy=False``), so setting ``actor_rollout_ref.ref.entropy_from_logits_with_chunking`` has no effect.
+
+On the Megatron backend, this flag additionally chunks the **log-probs** computation: log-probs and entropy are computed jointly per chunk by a fused op that shares the logsumexp intermediates (4 TP all-reduces per chunk instead of 6), which also eliminates the full-size logits clone that the previous path required. This only applies when ``use_fused_kernels=False``; the fused-kernels path never materializes the full logits in the first place. On the FSDP, VeOmni, Torchtitan and Automodel backends the flag only chunks the entropy calculation.
 
 Additionally, during training, standard gradient checkpointing (``enable_gradient_checkpointing=True``) does not apply to entropy calculations. To reduce memory peaks in this context, set:
 ``actor_rollout_ref.actor.entropy_checkpointing = True``
