@@ -277,7 +277,10 @@ def vocab_parallel_log_probs_and_entropy_with_chunking(
     Args:
         vocab_parallel_logits: (..., seq_len, vocab_size // tp_size)
         labels: (..., seq_len)
-        chunk_size: Number of sequence tokens to process at once. Defaults to 2048.
+        chunk_size: Number of tokens to process at once. The op is per-token over
+            the (..., seq_len) grid, so leading dims are flattened before chunking:
+            a chunk never exceeds ``chunk_size`` tokens regardless of batch packing
+            (e.g. padded dynamic-bsz micro-batches with nseq > 1). Defaults to 2048.
 
     Returns:
         (log_probs, entropy). ``log_probs`` has dtype float32; ``entropy`` has
@@ -291,20 +294,24 @@ def vocab_parallel_log_probs_and_entropy_with_chunking(
             f"labels shape {labels.shape}"
         )
 
-    log_probs = torch.empty(labels.shape, dtype=torch.float32, device=vocab_parallel_logits.device)
-    entropy = torch.empty(labels.shape, dtype=vocab_parallel_logits.dtype, device=vocab_parallel_logits.device)
-    seq_dim = vocab_parallel_logits.dim() - 2
-    seq_len = vocab_parallel_logits.shape[seq_dim]
+    out_shape = labels.shape
+    vocab_size = vocab_parallel_logits.shape[-1]
+    flat_logits = vocab_parallel_logits.reshape(-1, vocab_size)
+    flat_labels = labels.reshape(-1)
 
-    for start in range(0, seq_len, chunk_size):
-        end = min(start + chunk_size, seq_len)
-        logits_chunk = vocab_parallel_logits.narrow(seq_dim, start, end - start)
-        labels_chunk = labels.narrow(seq_dim, start, end - start)
+    log_probs = torch.empty(flat_labels.shape, dtype=torch.float32, device=vocab_parallel_logits.device)
+    entropy = torch.empty(flat_labels.shape, dtype=vocab_parallel_logits.dtype, device=vocab_parallel_logits.device)
+    ntok = flat_logits.shape[0]
+
+    for start in range(0, ntok, chunk_size):
+        end = min(start + chunk_size, ntok)
+        logits_chunk = flat_logits.narrow(0, start, end - start)
+        labels_chunk = flat_labels.narrow(0, start, end - start)
         log_probs_chunk, entropy_chunk = _VocabParallelLogProbsAndEntropy.apply(logits_chunk, labels_chunk)
-        log_probs.narrow(seq_dim, start, end - start).copy_(log_probs_chunk)
-        entropy.narrow(seq_dim, start, end - start).copy_(entropy_chunk.to(vocab_parallel_logits.dtype))
+        log_probs.narrow(0, start, end - start).copy_(log_probs_chunk)
+        entropy.narrow(0, start, end - start).copy_(entropy_chunk.to(vocab_parallel_logits.dtype))
 
-    return log_probs, entropy
+    return log_probs.reshape(out_shape), entropy.reshape(out_shape)
 
 
 def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
