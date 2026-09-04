@@ -170,6 +170,141 @@ def vocab_parallel_entropy_with_chunking(vocab_parallel_logits: torch.Tensor, ch
     return entropy
 
 
+def _log_probs_entropy_chunk_forward(logits_chunk, labels_chunk):
+    """Per-chunk forward math (fp32) shared by the fused autograd functions.
+
+    Returns (log_probs, entropy, aux) where aux holds the small per-token tensors
+    needed to recompute the chunk in backward.
+    """
+    logits = logits_chunk.float()
+    # `.float()` returns the input itself when it is already fp32 (the production
+    # path upcasts logits via Float16Module). In-place consumption below is only
+    # safe on a fresh copy (bf16/fp16 input) — never mutate the caller's tensor.
+    owns_fp32_copy = logits is not logits_chunk
+    tp_group = mpu.get_tensor_model_parallel_group()
+
+    # Shared stable-max normalisation. The elementwise chain is consumed in place:
+    # `shifted` becomes exp_shifted, then softmax — one full-size buffer total.
+    logits_max = logits.max(dim=-1, keepdim=True).values
+    dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
+    exp_shifted = (logits - logits_max).exp_()
+    sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
+    dist.all_reduce(sum_exp, group=tp_group)
+    logsumexp = logits_max + sum_exp.log()
+    softmax = exp_shifted.div_(sum_exp)
+
+    # Log-probs: gather the target logit from the owning TP partition and
+    # all-reduce the (masked) contributions, mirroring vocab_parallel_cross_entropy.
+    vocab_start = mpu.get_tensor_model_parallel_rank() * logits_chunk.size(-1)
+    target_mask = (labels_chunk < vocab_start) | (labels_chunk >= vocab_start + logits_chunk.size(-1))
+    masked_target = labels_chunk.clone() - vocab_start
+    masked_target[target_mask] = 0
+    predicted_logits = torch.gather(logits, -1, masked_target.unsqueeze(-1)).squeeze(-1)
+    predicted_logits = predicted_logits.masked_fill(target_mask, 0.0)
+    dist.all_reduce(predicted_logits, group=tp_group)
+    log_probs = predicted_logits - logsumexp.squeeze(-1)
+
+    # Entropy: logsumexp - sum(softmax * logits). Consume the fp32 copy in place
+    # when we own it (it is dead after this); otherwise fall back to a fresh product.
+    if owns_fp32_copy:
+        sum_softmax_times_logits = logits.mul_(softmax).sum(dim=-1, keepdim=True)
+    else:
+        sum_softmax_times_logits = (softmax * logits).sum(dim=-1, keepdim=True)
+    dist.all_reduce(sum_softmax_times_logits, group=tp_group)
+    entropy = (logsumexp - sum_softmax_times_logits).squeeze(-1)
+
+    aux = (logsumexp, entropy, masked_target, target_mask)
+    return log_probs, entropy, aux
+
+
+def _log_probs_entropy_chunk_backward(logits_chunk, aux, grad_log_probs, grad_entropy):
+    """Per-chunk backward math shared by the fused autograd functions.
+
+    Recomputes the fp32 logits from the low-precision chunk (exact upcast) and the
+    softmax from the saved logsumexp, reusing the log-softmax intermediate t:
+    d/dlogits = softmax * (-grad_entropy * (t + entropy) - grad_log_probs) + onehot.
+    Returns the fp32 chunk gradient (softmax buffer consumed).
+    """
+    logsumexp, entropy, masked_target, target_mask = aux
+    logits = logits_chunk.float()
+
+    t = logits - logsumexp
+    softmax = t.exp()
+
+    if grad_entropy is not None:
+        t.add_(entropy.unsqueeze(-1))
+        t.mul_(-grad_entropy.unsqueeze(-1))
+        if grad_log_probs is not None:
+            t.sub_(grad_log_probs.unsqueeze(-1))
+    else:
+        t = -grad_log_probs.unsqueeze(-1)
+    grad_chunk = softmax.mul_(t)
+
+    if grad_log_probs is not None:
+        src = grad_log_probs.masked_fill(target_mask, 0.0)
+        grad_chunk.scatter_add_(-1, masked_target.unsqueeze(-1), src.unsqueeze(-1))
+
+    return grad_chunk
+
+
+class _VocabParallelLogProbsAndEntropyChunked(torch.autograd.Function):
+    """Chunked joint log-probs + entropy as a single autograd node.
+
+    Applying the per-chunk op to ``narrow`` views makes autograd run
+    ``slice_backward`` per chunk in backward, each materialising a full-size
+    zeros buffer of the whole logits shape (two such buffers were observed live
+    simultaneously in e2e snapshots, ~2 x 8.3 GiB at [~9k, 248320] fp32). As a
+    single node, backward allocates exactly one full-size gradient buffer and
+    fills the disjoint chunk rows as it recomputes each chunk — the full-size
+    gradient itself is unavoidable (the lm-head backward needs it), but the
+    per-chunk full-size zeros buffers and their accumulation buffer are gone.
+    """
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits: torch.Tensor, labels: torch.Tensor, chunk_size: int):
+        out_shape = labels.shape
+        vocab_size = vocab_parallel_logits.shape[-1]
+        flat_logits = vocab_parallel_logits.reshape(-1, vocab_size)
+        flat_labels = labels.reshape(-1)
+        ntok = flat_logits.shape[0]
+
+        log_probs = torch.empty(flat_labels.shape, dtype=torch.float32, device=vocab_parallel_logits.device)
+        entropy = torch.empty(flat_labels.shape, dtype=vocab_parallel_logits.dtype, device=vocab_parallel_logits.device)
+        aux_per_chunk = []
+        for start in range(0, ntok, chunk_size):
+            end = min(start + chunk_size, ntok)
+            lp, ent, aux = _log_probs_entropy_chunk_forward(
+                flat_logits.narrow(0, start, end - start), flat_labels.narrow(0, start, end - start)
+            )
+            log_probs[start:end] = lp
+            entropy[start:end] = ent.to(vocab_parallel_logits.dtype)
+            aux_per_chunk.append((start, end, aux))
+
+        ctx.input_dtype = vocab_parallel_logits.dtype
+        ctx.aux_per_chunk = aux_per_chunk
+        ctx.save_for_backward(vocab_parallel_logits)
+        return log_probs.reshape(out_shape), entropy.reshape(out_shape)
+
+    @staticmethod
+    def backward(ctx, grad_log_probs: torch.Tensor, grad_entropy: torch.Tensor):
+        (vocab_parallel_logits,) = ctx.saved_tensors
+        flat_logits = vocab_parallel_logits.reshape(-1, vocab_parallel_logits.shape[-1])
+        flat_glp = grad_log_probs.reshape(-1) if grad_log_probs is not None else None
+        flat_ge = grad_entropy.reshape(-1) if grad_entropy is not None else None
+
+        # Exactly one full-size buffer; chunk rows are disjoint so plain fills suffice.
+        grad = torch.empty_like(flat_logits)
+        for start, end, aux in ctx.aux_per_chunk:
+            grad_chunk = _log_probs_entropy_chunk_backward(
+                flat_logits.narrow(0, start, end - start),
+                aux,
+                flat_glp[start:end] if flat_glp is not None else None,
+                flat_ge[start:end] if flat_ge is not None else None,
+            )
+            grad[start:end] = grad_chunk.to(ctx.input_dtype)
+        return grad.reshape(vocab_parallel_logits.shape), None, None
+
+
 class _VocabParallelLogProbsAndEntropy(torch.autograd.Function):
     """Compute log-probs and entropy jointly for one chunk of TP-sharded logits.
 
@@ -191,79 +326,19 @@ class _VocabParallelLogProbsAndEntropy(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, vocab_parallel_logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = vocab_parallel_logits.float()
-        # `.float()` returns the input itself when it is already fp32 (the production
-        # path upcasts logits via Float16Module). In-place consumption below is only
-        # safe on a fresh copy (bf16/fp16 input) — never mutate the caller's tensor.
-        owns_fp32_copy = logits is not vocab_parallel_logits
-        tp_group = mpu.get_tensor_model_parallel_group()
-
-        # Shared stable-max normalisation. The elementwise chain is consumed in place:
-        # `shifted` becomes exp_shifted, then softmax — one full-size buffer total.
-        logits_max = logits.max(dim=-1, keepdim=True).values
-        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
-        exp_shifted = (logits - logits_max).exp_()
-        sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
-        dist.all_reduce(sum_exp, group=tp_group)
-        logsumexp = logits_max + sum_exp.log()
-        softmax = exp_shifted.div_(sum_exp)
-
-        # Log-probs: gather the target logit from the owning TP partition and
-        # all-reduce the (masked) contributions, mirroring vocab_parallel_cross_entropy.
-        vocab_start = mpu.get_tensor_model_parallel_rank() * vocab_parallel_logits.size(-1)
-        target_mask = (labels < vocab_start) | (labels >= vocab_start + vocab_parallel_logits.size(-1))
-        masked_target = labels.clone() - vocab_start
-        masked_target[target_mask] = 0
-        predicted_logits = torch.gather(logits, -1, masked_target.unsqueeze(-1)).squeeze(-1)
-        predicted_logits = predicted_logits.masked_fill(target_mask, 0.0)
-        dist.all_reduce(predicted_logits, group=tp_group)
-        log_probs = predicted_logits - logsumexp.squeeze(-1)
-
-        # Entropy: logsumexp - sum(softmax * logits). Consume the fp32 copy in place
-        # when we own it (it is dead after this); otherwise fall back to a fresh product.
-        if owns_fp32_copy:
-            sum_softmax_times_logits = logits.mul_(softmax).sum(dim=-1, keepdim=True)
-        else:
-            sum_softmax_times_logits = (softmax * logits).sum(dim=-1, keepdim=True)
-        dist.all_reduce(sum_softmax_times_logits, group=tp_group)
-        entropy = (logsumexp - sum_softmax_times_logits).squeeze(-1)
-
+        log_probs, entropy, aux = _log_probs_entropy_chunk_forward(vocab_parallel_logits, labels)
         ctx.input_dtype = vocab_parallel_logits.dtype
-        ctx.save_for_backward(vocab_parallel_logits, logsumexp, entropy, masked_target, target_mask)
+        ctx.save_for_backward(vocab_parallel_logits, *aux)
         return log_probs, entropy
 
     @staticmethod
     def backward(ctx, grad_log_probs: torch.Tensor, grad_entropy: torch.Tensor) -> tuple[torch.Tensor, None]:
         vocab_parallel_logits, logsumexp, entropy, masked_target, target_mask = ctx.saved_tensors
-
-        # Recompute the fp32 logits from the saved low-precision input. The
-        # upcast is exact (bf16/fp16 values are representable in fp32), so this
-        # is bit-identical to saving the fp32 logits at half the persistent bytes.
-        logits = vocab_parallel_logits.float()
-
-        # t = logits - logsumexp is the log-softmax; softmax is recomputed from
-        # it and the entropy term reuses it: logsumexp - entropy - logits == -(t + entropy).
-        t = logits - logsumexp
-        softmax = t.exp()
-
-        # Dense part: d/dlogits = softmax * (-grad_entropy * (t + entropy) - grad_log_probs),
-        # accumulated in place into t and then softmax (both freshly allocated above,
-        # so in-place mutation is safe).
-        if grad_entropy is not None:
-            t.add_(entropy.unsqueeze(-1))
-            t.mul_(-grad_entropy.unsqueeze(-1))
-            if grad_log_probs is not None:
-                t.sub_(grad_log_probs.unsqueeze(-1))
-        else:
-            t = -grad_log_probs.unsqueeze(-1)
-        grad_logits = softmax.mul_(t)
-
-        # Sparse part: the onehot(label) contribution of log_probs, added only on
-        # the TP partition owning the label (masked rows contribute nothing).
-        if grad_log_probs is not None:
-            src = grad_log_probs.masked_fill(target_mask, 0.0)
-            grad_logits.scatter_add_(-1, masked_target.unsqueeze(-1), src.unsqueeze(-1))
-
+        # The upcast bf16/fp16 -> fp32 is exact, so recomputing logits from the
+        # saved low-precision input is bit-identical to saving fp32 logits.
+        grad_logits = _log_probs_entropy_chunk_backward(
+            vocab_parallel_logits, (logsumexp, entropy, masked_target, target_mask), grad_log_probs, grad_entropy
+        )
         return grad_logits.to(ctx.input_dtype), None
 
 
@@ -278,8 +353,10 @@ def vocab_parallel_log_probs_and_entropy_with_chunking(
     once so that ``vocab_parallel_entropy`` and
     ``vocab_parallel_log_probs_from_logits`` can consume disjoint tensors. For a
     large vocabulary that full clone is a common OOM source. This function
-    processes the sequence dimension in chunks with a fused
-    :class:`_VocabParallelLogProbsAndEntropy` op and returns results equivalent
+    processes the sequence dimension in chunks inside a single fused
+    :class:`_VocabParallelLogProbsAndEntropyChunked` autograd node — so backward
+    allocates one full-size gradient buffer instead of a full-size
+    ``slice_backward`` zeros buffer per chunk — and returns results equivalent
     to the two individual calls.
 
     Args:
@@ -302,24 +379,7 @@ def vocab_parallel_log_probs_and_entropy_with_chunking(
             f"labels shape {labels.shape}"
         )
 
-    out_shape = labels.shape
-    vocab_size = vocab_parallel_logits.shape[-1]
-    flat_logits = vocab_parallel_logits.reshape(-1, vocab_size)
-    flat_labels = labels.reshape(-1)
-
-    log_probs = torch.empty(flat_labels.shape, dtype=torch.float32, device=vocab_parallel_logits.device)
-    entropy = torch.empty(flat_labels.shape, dtype=vocab_parallel_logits.dtype, device=vocab_parallel_logits.device)
-    ntok = flat_logits.shape[0]
-
-    for start in range(0, ntok, chunk_size):
-        end = min(start + chunk_size, ntok)
-        logits_chunk = flat_logits.narrow(0, start, end - start)
-        labels_chunk = flat_labels.narrow(0, start, end - start)
-        log_probs_chunk, entropy_chunk = _VocabParallelLogProbsAndEntropy.apply(logits_chunk, labels_chunk)
-        log_probs.narrow(0, start, end - start).copy_(log_probs_chunk)
-        entropy.narrow(0, start, end - start).copy_(entropy_chunk.to(vocab_parallel_logits.dtype))
-
-    return log_probs.reshape(out_shape), entropy.reshape(out_shape)
+    return _VocabParallelLogProbsAndEntropyChunked.apply(vocab_parallel_logits, labels, chunk_size)
 
 
 def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
