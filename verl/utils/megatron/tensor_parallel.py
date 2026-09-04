@@ -192,17 +192,21 @@ class _VocabParallelLogProbsAndEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vocab_parallel_logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = vocab_parallel_logits.float()
+        # `.float()` returns the input itself when it is already fp32 (the production
+        # path upcasts logits via Float16Module). In-place consumption below is only
+        # safe on a fresh copy (bf16/fp16 input) — never mutate the caller's tensor.
+        owns_fp32_copy = logits is not vocab_parallel_logits
         tp_group = mpu.get_tensor_model_parallel_group()
 
-        # Shared stable-max normalisation.
+        # Shared stable-max normalisation. The elementwise chain is consumed in place:
+        # `shifted` becomes exp_shifted, then softmax — one full-size buffer total.
         logits_max = logits.max(dim=-1, keepdim=True).values
         dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
-        shifted = logits - logits_max
-        exp_shifted = shifted.exp()
+        exp_shifted = (logits - logits_max).exp_()
         sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
         dist.all_reduce(sum_exp, group=tp_group)
         logsumexp = logits_max + sum_exp.log()
-        softmax = exp_shifted / sum_exp
+        softmax = exp_shifted.div_(sum_exp)
 
         # Log-probs: gather the target logit from the owning TP partition and
         # all-reduce the (masked) contributions, mirroring vocab_parallel_cross_entropy.
@@ -215,8 +219,12 @@ class _VocabParallelLogProbsAndEntropy(torch.autograd.Function):
         dist.all_reduce(predicted_logits, group=tp_group)
         log_probs = predicted_logits - logsumexp.squeeze(-1)
 
-        # Entropy: logsumexp - sum(softmax * logits).
-        sum_softmax_times_logits = (softmax * logits).sum(dim=-1, keepdim=True)
+        # Entropy: logsumexp - sum(softmax * logits). Consume the fp32 copy in place
+        # when we own it (it is dead after this); otherwise fall back to a fresh product.
+        if owns_fp32_copy:
+            sum_softmax_times_logits = logits.mul_(softmax).sum(dim=-1, keepdim=True)
+        else:
+            sum_softmax_times_logits = (softmax * logits).sum(dim=-1, keepdim=True)
         dist.all_reduce(sum_softmax_times_logits, group=tp_group)
         entropy = (logsumexp - sum_softmax_times_logits).squeeze(-1)
 
